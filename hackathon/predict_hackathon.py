@@ -298,7 +298,7 @@ def prepare_protein_complex(datapoint_id: str, proteins: List[Protein], input_di
     neighbours = get_epitope_patches(antigen_cif_path, n_patches=10, radius=8.0)
     
     commands = []
-    cli_args = ["--diffusion_samples", "3"]
+    cli_args = ["--diffusion_samples", "5"]
     for i in range(len(neighbours)):
         input_dict_copy = deepcopy(input_dict)
         input_dict_copy["constraints"] = [{"pocket": {"binder": "H",
