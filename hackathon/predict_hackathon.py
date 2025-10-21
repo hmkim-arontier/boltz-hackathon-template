@@ -2,18 +2,257 @@
 import argparse
 import json
 import os
+import sys
+from pprint import pprint
 import shutil
 import subprocess
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any, List, Optional
-
+import glob
+from Bio.PDB import PDBParser, Superimposer, PDBIO
+import numpy as np
+from itertools import combinations
 import yaml
 from hackathon_api import Datapoint, Protein, SmallMolecule
+import numpy as np
+from Bio.PDB import PDBParser, MMCIFParser, SASA, NeighborSearch
+from copy import deepcopy
+import warnings
+warnings.filterwarnings('ignore')
 
 # ---------------------------------------------------------------------------
 # ---- Participants should modify these four functions ----------------------
 # ---------------------------------------------------------------------------
+
+class SpatialEpitopePatchExtractor:
+    """
+    Extract spatial patches from protein structure based on surface accessibility.
+    Each patch represents a potential epitope for antibody binding constraints.
+    """
+    
+    def __init__(self, structure_file):
+        """
+        Initialize with PDB or CIF structure file.
+        
+        Args:
+            structure_file: Path to PDB or CIF file
+        """
+        self.structure_file = structure_file
+        
+        # Determine file type and use appropriate parser
+        if structure_file.lower().endswith('.cif'):
+            self.parser = MMCIFParser(QUIET=True)
+        else:
+            self.parser = PDBParser(QUIET=True)
+        
+        self.structure = self.parser.get_structure('antigen', structure_file)
+        self.model = self.structure[0]
+        
+        # Get all standard residues
+        self.residues = [res for res in self.model.get_residues() if res.id[0] == ' ']
+        
+        # Build neighbor search structure
+        self.atoms = [atom for atom in self.model.get_atoms()]
+        self.neighbor_search = NeighborSearch(self.atoms)
+        
+        # Calculate SASA for all residues
+        self._calculate_sasa()
+        
+        # print(f"Loaded structure: {len(self.residues)} residues")
+    
+    def _calculate_sasa(self):
+        """Calculate SASA for all residues using Shrake-Rupley algorithm."""
+        print("Calculating SASA...")
+        sasa_calculator = SASA.ShrakeRupley()
+        sasa_calculator.compute(self.model, level="R")
+        print("SASA calculation complete")
+    
+    def get_residue_center(self, residue):
+        """
+        Calculate the geometric center of a residue.
+        
+        Args:
+            residue: Bio.PDB residue object
+            
+        Returns:
+            numpy array of 3D coordinates
+        """
+        coords = np.array([atom.get_coord() for atom in residue.get_atoms()])
+        return np.mean(coords, axis=0)
+    
+    def find_spatial_neighbors(self, residue, radius=10.0):
+        """
+        Find all residues within spatial distance of target residue.
+        
+        Args:
+            residue: Target residue
+            radius: Search radius in Angstroms (default: 10.0)
+            
+        Returns:
+            List of neighboring residues (excluding the target itself)
+        """
+        center = self.get_residue_center(residue)
+        neighbors = self.neighbor_search.search(center, radius, level='R')
+        
+        # Filter: only standard residues, exclude target residue
+        neighbors = [n for n in neighbors if n.id[0] == ' ' and n != residue]
+        
+        return neighbors
+    
+    def get_patch_info(self, center_residue, neighbors):
+        """
+        Extract detailed information about a patch (center + neighbors).
+        
+        Args:
+            center_residue: Central residue of the patch
+            neighbors: List of neighboring residues
+            
+        Returns:
+            Dictionary with patch information
+        """
+        # Get center residue info
+        center_chain = center_residue.get_parent().id
+        center_resid = center_residue.id[1]
+        center_sasa = getattr(center_residue, 'sasa', 0)
+        
+        # Get neighbor info
+        neighbor_info = []
+        sasa_values = []
+        
+        for neighbor in neighbors:
+            n_chain = neighbor.get_parent().id
+            n_resid = neighbor.id[1]
+            n_sasa = getattr(neighbor, 'sasa', 0)
+            
+            neighbor_info.append({
+                'chain': n_chain,
+                'resid': n_resid,
+                'sasa': n_sasa
+            })
+            sasa_values.append(n_sasa)
+        
+        # Calculate mean SASA
+        if len(sasa_values) > 0:
+            mean_sasa = np.mean(sasa_values)
+            total_sasa = np.sum(sasa_values)
+        else:
+            mean_sasa = 0
+            total_sasa = 0
+        
+        return {
+            'center': {
+                'chain': center_chain,
+                'resid': center_resid,
+                'sasa': center_sasa
+            },
+            'neighbors': neighbor_info,
+            'num_neighbors': len(neighbors),
+            'mean_sasa': mean_sasa,
+            'total_sasa': total_sasa,
+            'center_sasa': center_sasa
+        }
+    
+    def extract_all_patches(self, radius=10.0):
+        """
+        Extract patches for all residues in the structure.
+        
+        Args:
+            radius: Search radius in Angstroms for defining patches
+            
+        Returns:
+            List of patch dictionaries
+        """
+        print(f"\nExtracting patches (radius={radius}Å)...")
+        patches = []
+        
+        for i, residue in enumerate(self.residues):
+            # Find spatial neighbors
+            neighbors = self.find_spatial_neighbors(residue, radius)
+            
+            # Get patch information
+            patch_info = self.get_patch_info(residue, neighbors)
+            patch_info['patch_id'] = i + 1  # 1-indexed
+            
+            patches.append(patch_info)
+        
+        print(f"Extracted {len(patches)} patches")
+        return patches
+    
+    def rank_patches_by_mean_sasa(self, patches):
+        """
+        Rank patches by mean SASA of neighbors.
+        
+        Args:
+            patches: List of patch dictionaries
+            
+        Returns:
+            List of patches sorted by mean SASA (descending)
+        """
+        sorted_patches = sorted(patches, key=lambda x: x['mean_sasa'], reverse=True)
+        return sorted_patches
+    
+    def get_top_patches_as_tuples(self, n=20, radius=10.0):
+        """
+        Get top N patches and return as list of neighbor tuples.
+        
+        Args:
+            n: Number of top patches to return
+            radius: Search radius in Angstroms
+            
+        Returns:
+            List of lists, where each inner list contains (chain_id, resid) tuples
+            Format: [[(CHID, #), (CHID, #), ...], [(CHID, #), ...], ...]
+        """
+        # Extract all patches
+        patches = self.extract_all_patches(radius=radius)
+        
+        # Rank by mean SASA
+        ranked_patches = self.rank_patches_by_mean_sasa(patches)
+        
+        # Get top N
+        top_patches = ranked_patches[:n]
+        
+        # Convert to tuple format
+        result = []
+        for patch in top_patches:
+            # Create list of (chain_id, resid) tuples for neighbors
+            neighbor_tuples = [
+                [neighbor['chain'], neighbor['resid']] 
+                for neighbor in patch['neighbors']
+            ]
+            result.append(neighbor_tuples)
+        
+        # Display summary
+        print("\n" + "="*80)
+        print(f"TOP {n} EPITOPE PATCHES (Ranked by Mean SASA)")
+        print("="*80)
+        
+        for i, (patch, neighbor_tuples) in enumerate(zip(top_patches, result), 1):
+            print(f"\nPatch {i}:")
+            print(f"  Center: {patch['center']['chain']}:{patch['center']['resid']}")
+            print(f"  Number of neighbors: {len(neighbor_tuples)}")
+            print(f"  Mean neighbor SASA: {patch['mean_sasa']:.2f} Ų")
+            print(f"  Neighbors: {neighbor_tuples[:5]}{'...' if len(neighbor_tuples) > 5 else ''}")
+        
+        return result
+        
+def get_epitope_patches(cif_path, n_patches=20, radius=10.0):
+    """
+    Main function to extract epitope patches from a CIF file.
+    
+    Args:
+        cif_path: Path to CIF file
+        n_patches: Number of top patches to return (default: 20)
+        radius: Search radius in Angstroms (default: 10.0)
+        
+    Returns:
+        neighbours: List of N patches, where each patch is a list of (chain_id, resid) tuples
+                   Format: [[(CHID, #), (CHID, #), ...], [(CHID, #), ...], ...]
+    """
+    extractor = SpatialEpitopePatchExtractor(cif_path)
+    neighbours = extractor.get_top_patches_as_tuples(n=n_patches, radius=radius)
+    return neighbours
 
 def prepare_protein_complex(datapoint_id: str, proteins: List[Protein], input_dict: dict, msa_dir: Optional[Path] = None) -> List[tuple[dict, List[str]]]:
     """
@@ -36,17 +275,41 @@ def prepare_protein_complex(datapoint_id: str, proteins: List[Protein], input_di
     # ```
     # input_dict["constraints"] = [{
     #   "contact": {
-    #       "token1" : [CHAIN_ID, RES_IDX/ATOM_NAME], 
+    #       "token1" : [CHAIN_ID, RES_IDX/ATOM_NAME],
     #       "token1" : [CHAIN_ID, RES_IDX/ATOM_NAME]
     #   }
     # }]
     # ```
     #
     # will add contact constraints to the input_dict
-
-    # Example: predict 5 structures
-    cli_args = ["--diffusion_samples", "5"]
-    return [(input_dict, cli_args)]
+    ##################################################
+    input_dict_antigen_only = {'sequences': [item for item in input_dict['sequences'] if item['protein']['id'] == 'A'],
+                               'version': input_dict['version']}
+    with open("yaml_antigen_only.yaml", "w") as f:
+        yaml.dump(input_dict_antigen_only, f, sort_keys=False)
+    out_dir = args.intermediate_dir / "predictions_ag_only"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    cache = os.environ.get("BOLTZ_CACHE", str(Path.home() / ".boltz"))
+    os.system(f"boltz predict yaml_antigen_only.yaml \
+                    --devices 1 --out_dir {out_dir} --cache {cache} --no_kernels --override")
+    antigen_cif_path = f"{out_dir}/boltz_results_yaml_antigen_only/predictions/yaml_antigen_only/yaml_antigen_only_model_0.cif"
+    
+    # get neighbours in format: [N1, N2, ..., N20] where Ni=[(CHID, #), (CHID, #), ..., (CHID, #)]
+    neighbours = get_epitope_patches(antigen_cif_path, n_patches=10, radius=8.0)
+    
+    commands = []
+    cli_args = ["--diffusion_samples", "3"]
+    for i in range(len(neighbours)):
+        input_dict_copy = deepcopy(input_dict)
+        input_dict_copy["constraints"] = [{"pocket": {"binder": "H",
+                                                      "contacts": neighbours[i]}}]
+        assert isinstance(input_dict_copy["constraints"], list)
+        input_dict_copy["templates"] = [{"cif": antigen_cif_path,
+                                         "chain_id": ["A"],
+                                         "template_id": ["A"]}]
+        commands.append((input_dict_copy, cli_args))
+    ##################################################
+    return commands
 
 def prepare_protein_ligand(datapoint_id: str, protein: Protein, ligands: list[SmallMolecule], input_dict: dict, msa_dir: Optional[Path] = None) -> List[tuple[dict, List[str]]]:
     """
@@ -80,6 +343,99 @@ def prepare_protein_ligand(datapoint_id: str, protein: Protein, ligands: list[Sm
     cli_args = ["--diffusion_samples", "5"]
     return [(input_dict, cli_args)]
 
+
+def extract_chain_atoms(structure, chain_id):
+    """Extract CA atoms from a specific chain."""
+    atoms = []
+    for model in structure:
+        if chain_id in [chain.id for chain in model]:
+            chain = model[chain_id]
+            atoms = [atom for residue in chain for atom in residue if atom.name == 'CA']
+            break
+    return atoms
+
+def align_structures(pdb_file1, pdb_file2, h_chain='H', l_chain='L', rmsd_threshold=2.0):
+    """
+    Align two PDB structures based on H and L chains.
+    
+    Args:
+        pdb_file1: Path to first PDB file
+        pdb_file2: Path to second PDB file
+        h_chain: Chain ID for heavy chain (default 'H')
+        l_chain: Chain ID for light chain (default 'L')
+        rmsd_threshold: RMSD threshold for considering structures similar (default 2.0 Å)
+    
+    Returns:
+        bool: True if structures are well aligned (RMSD < threshold), False otherwise
+    """
+    parser = PDBParser(QUIET=True)
+    
+    # Load structures
+    structure1 = parser.get_structure('struct1', pdb_file1)
+    structure2 = parser.get_structure('struct2', pdb_file2)
+    
+    # Extract atoms from both chains
+    h_atoms1 = extract_chain_atoms(structure1, h_chain)
+    l_atoms1 = extract_chain_atoms(structure1, l_chain)
+    h_atoms2 = extract_chain_atoms(structure2, h_chain)
+    l_atoms2 = extract_chain_atoms(structure2, l_chain)
+    
+    # Combine H and L chain atoms
+    atoms1 = h_atoms1 + l_atoms1
+    atoms2 = h_atoms2 + l_atoms2
+    
+    # Check if both structures have the same number of atoms
+    if len(atoms1) != len(atoms2):
+        print(f"Warning: Different number of atoms ({len(atoms1)} vs {len(atoms2)})")
+        # Use minimum length for alignment
+        min_len = min(len(atoms1), len(atoms2))
+        atoms1 = atoms1[:min_len]
+        atoms2 = atoms2[:min_len]
+    
+    if len(atoms1) == 0:
+        print("Error: No atoms found for alignment")
+        return False
+    
+    # Perform superimposition
+    super_imposer = Superimposer()
+    super_imposer.set_atoms(atoms1, atoms2)
+    rmsd = super_imposer.rms
+    
+    print(f"RMSD: {rmsd:.3f} Å")
+    
+    return rmsd < rmsd_threshold
+
+def check_all_structures_similar(pdb_files, h_chain='H', l_chain='L', rmsd_threshold=2.0):
+    """
+    Check if all 5 PDB structures are similar by pairwise comparison.
+    
+    Args:
+        pdb_files: List of paths to PDB files
+        h_chain: Chain ID for heavy chain
+        l_chain: Chain ID for light chain
+        rmsd_threshold: RMSD threshold for similarity
+    
+    Returns:
+        bool: True if all structures are mutually similar, False otherwise
+    """
+    n = len(pdb_files)
+    print(f"Comparing {n} structures...\n")
+    
+    # Compare all pairs
+    all_similar = True
+    for i, j in combinations(range(n), 2):
+        print(f"Comparing {pdb_files[i]} vs {pdb_files[j]}:")
+        is_similar = align_structures(pdb_files[i], pdb_files[j], h_chain, l_chain, rmsd_threshold)
+        print(f"Result: {'Similar' if is_similar else 'Different'}\n")
+        
+        if not is_similar:
+            all_similar = False
+    
+    return all_similar
+
+
+
+
 def post_process_protein_complex(datapoint: Datapoint, input_dicts: List[dict[str, Any]], cli_args_list: List[list[str]], prediction_dirs: List[Path]) -> List[Path]:
     """
     Return ranked model files for protein complex submission.
@@ -93,13 +449,29 @@ def post_process_protein_complex(datapoint: Datapoint, input_dicts: List[dict[st
     """
     # Collect all PDBs from all configurations
     all_pdbs = []
+    all_logs = []
     for prediction_dir in prediction_dirs:
-        config_pdbs = sorted(prediction_dir.glob(f"{datapoint.datapoint_id}_config_*_model_*.pdb"))
-        all_pdbs.extend(config_pdbs)
+        pdbs = sorted(prediction_dir.glob(f"{datapoint.datapoint_id}_config_*_model_*.pdb"))
+        logs = sorted(prediction_dir.glob(f"confidence_{datapoint.datapoint_id}_config_*_model_*.json"))
 
-    # Sort all PDBs and return their paths
-    all_pdbs = sorted(all_pdbs)
-    return all_pdbs
+        result = check_all_structures_similar(pdbs, h_chain="H", l_chain="L", rmsd_threshold=2.5)
+        if result:
+            all_pdbs.extend(pdbs)
+            all_logs.extend(logs)
+
+    threshold = 0.3
+    storage_pair_chains_iptm = []
+    for pdb_path, log_path in zip(all_pdbs, all_logs):
+        with open(log_path, "r") as f:
+            data = json.load(f)
+        per_chains_iptm = data["pair_chains_iptm"]["2"]
+        value = per_chains_iptm["0"] * per_chains_iptm["1"] * per_chains_iptm["2"]
+
+        if value > threshold:
+            storage_pair_chains_iptm.append([pdb_path, value]) # <===
+    storage_pair_chains_iptm.sort(key=lambda x: x[-1], reverse=True) # in place
+    storage_pdbs = [d[0] for d in storage_pair_chains_iptm]
+    return storage_pdbs
 
 def post_process_protein_ligand(datapoint: Datapoint, input_dicts: List[dict[str, Any]], cli_args_list: List[list[str]], prediction_dirs: List[Path]) -> List[Path]:
     """
@@ -243,6 +615,7 @@ def _run_boltz_and_collect(datapoint) -> None:
             "--cache", cache,
             "--no_kernels",
             "--output_format", "pdb",
+            "--override"
         ]
         cmd = fixed + cli_args
         print(f"Running config {config_idx}:", " ".join(cmd), flush=True)
@@ -254,7 +627,7 @@ def _run_boltz_and_collect(datapoint) -> None:
         all_input_dicts.append(input_dict)
         all_cli_args.append(cli_args)
         all_pred_subfolders.append(pred_subfolder)
-
+        
     # Post-process and copy submissions
     if datapoint.task_type == "protein_complex":
         ranked_files = post_process_protein_complex(datapoint, all_input_dicts, all_cli_args, all_pred_subfolders)
@@ -262,11 +635,11 @@ def _run_boltz_and_collect(datapoint) -> None:
         ranked_files = post_process_protein_ligand(datapoint, all_input_dicts, all_cli_args, all_pred_subfolders)
     else:
         raise ValueError(f"Unknown task_type: {datapoint.task_type}")
-
+    
     if not ranked_files:
         raise FileNotFoundError(f"No model files found for {datapoint.datapoint_id}")
 
-    for i, file_path in enumerate(ranked_files[:5]):
+    for i, file_path in enumerate(ranked_files[:min(len(ranked_files), 5)]):
         target = subdir / (f"model_{i}.pdb" if file_path.suffix == ".pdb" else f"model_{i}{file_path.suffix}")
         shutil.copy2(file_path, target)
         print(f"Saved: {target}")
